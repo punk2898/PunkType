@@ -163,6 +163,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var settingsWindow: NSWindow?
     private var overlayPanel: NSPanel?
 
+    // Fn-key trigger (handled via NSEvent monitors, not Carbon)
+    private var fnMonitors: [Any] = []
+    private var fnIsDown = false
+    private var otherKeyDuringFn = false
+
     /// Drives the floating overlay independently of the (localizable) status text.
     enum OverlayPhase { case hidden, listening, processing, done }
 
@@ -175,6 +180,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// Frontmost app PID captured when recording started — used to detect
     /// whether the user switched away before the result was ready.
     private var recordingFrontmostPID: pid_t?
+
+    /// App scene captured at recording start → injected into the prompt so the
+    /// cleanup tone matches where you're typing (chat/mail/code/…).
+    private var recordingAppContext: AppContextService.Context?
 
     /// Selected text captured when recording started → command mode
     private var commandTarget: String?
@@ -238,9 +247,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     /// (Re)register the global hotkey from the current settings preset.
     func registerHotkey() {
+        // Tear down whichever mechanism is currently active.
         if let existing = hotKeyRef {
             UnregisterEventHotKey(existing)
             hotKeyRef = nil
+        }
+        removeFnMonitor()
+
+        // Fn key uses a flagsChanged monitor (Carbon can't bind a lone Fn key).
+        if settings.hotkey == "fn" {
+            installFnMonitor()
+            print("[PunkType] ⌨️ Hotkey: 🌐 Fn key")
+            return
         }
 
         let preset = settings.hotkeyPreset
@@ -254,6 +272,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             &hotKeyRef
         )
         print("[PunkType] ⌨️ Hotkey registered: \(preset.label)")
+    }
+
+    // MARK: - Fn-key monitor
+
+    /// A tap of the Fn (🌐) key toggles recording. We trigger on Fn *release*,
+    /// and only if no other key was pressed while Fn was held — so Fn+F-key
+    /// combos and Globe shortcuts don't accidentally fire it.
+    private func installFnMonitor() {
+        fnIsDown = false
+        otherKeyDuringFn = false
+
+        let addFlags: (NSEvent) -> Void = { [weak self] event in
+            MainActor.assumeIsolated { self?.handleFnFlags(event) }
+        }
+        let addKey: (NSEvent) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated { self?.noteKeyDuringFn() }
+        }
+
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged, handler: addFlags) {
+            fnMonitors.append(m)
+        }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged, handler: { e in addFlags(e); return e }) {
+            fnMonitors.append(m)
+        }
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: addKey) {
+            fnMonitors.append(m)
+        }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { e in addKey(e); return e }) {
+            fnMonitors.append(m)
+        }
+    }
+
+    private func removeFnMonitor() {
+        for m in fnMonitors { NSEvent.removeMonitor(m) }
+        fnMonitors.removeAll()
+        fnIsDown = false
+        otherKeyDuringFn = false
+    }
+
+    private func handleFnFlags(_ event: NSEvent) {
+        let isFn = event.modifierFlags.contains(.function)
+        if isFn && !fnIsDown {
+            fnIsDown = true
+            otherKeyDuringFn = false
+        } else if !isFn && fnIsDown {
+            fnIsDown = false
+            if !otherKeyDuringFn {
+                toggleRecording()
+            }
+        }
+    }
+
+    private func noteKeyDuringFn() {
+        if fnIsDown { otherKeyDuringFn = true }
     }
 
     // MARK: - Overlay Window
@@ -401,8 +473,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
         ensureRecognizer()
 
-        // Remember where we started so we can tell if the user switches away.
+        // Remember where we started so we can tell if the user switches away,
+        // and capture the app scene for tone adaptation.
         recordingFrontmostPID = FocusService.frontmostPID()
+        recordingAppContext = settings.appAware
+            ? AppContextService.current(forPID: recordingFrontmostPID)
+            : nil
 
         // Command mode: text selected in the host app → speak an instruction
         commandTarget = settings.isConfigured ? SelectionService.selectedText() : nil
@@ -424,6 +500,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             }
         }
 
+        // Start cue — play before the engine starts so the mic won't capture it.
+        if settings.playSounds { SoundService.playStart() }
+
         do {
             try speechRecognizer.startRecording()
         } catch {
@@ -439,6 +518,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         isRecording = false
         overlayPhase = .processing
         statusText = "AI 处理中…"
+
+        // Stop cue — the engine is stopped synchronously inside stopRecording
+        // below, and the system sound has enough latency that it isn't captured.
+        if settings.playSounds { SoundService.playStop() }
 
         speechRecognizer.stopRecording { @Sendable [weak self] rawText in
             Task { @MainActor in
@@ -484,6 +567,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
 
         await processAndPaste(trimmed)
+    }
+
+    // MARK: - Prompt building (glossary + app-aware tone)
+
+    /// Build the system prompt for a cleanup tier: base prompt + dictionary
+    /// glossary + the captured app scene hint (when App-aware is on).
+    private func buildPrompt(for tier: String, dictionary: DictionaryStore) -> String {
+        var prompt = (tier == "format") ? settings.formatPrompt : settings.systemPrompt
+        if settings.injectGlossary, let glossary = dictionary.correctionGlossary {
+            prompt += glossary
+        }
+        if let ctx = recordingAppContext {
+            prompt += "\n\n【当前场景】用户正在「\(ctx.appName)」中输入。"
+                + (ctx.hint ?? "请贴合该应用常见的输入场景自然整理。")
+        }
+        // Personal style — polish only (formatted emails/reports keep their own tone).
+        if settings.applyStyle, tier != "format", let style = StyleProfileStore.shared.promptBlock {
+            prompt += style
+        }
+        return prompt
     }
 
     // MARK: - Tier pipeline + Paste
@@ -554,10 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             case "fast":
                 break // raw transcription as-is
             case "format":
-                var prompt = settings.formatPrompt
-                if settings.injectGlossary, let glossary = dictionary.correctionGlossary {
-                    prompt += glossary
-                }
+                let prompt = buildPrompt(for: "format", dictionary: dictionary)
                 let m = settings.model(for: "format")
                 output = try await DeepSeekService.cleanup(
                     text: rawText,
@@ -570,10 +670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 )
                 usedModel = m
             default: // polish
-                var prompt = settings.systemPrompt
-                if settings.injectGlossary, let glossary = dictionary.correctionGlossary {
-                    prompt += glossary
-                }
+                let prompt = buildPrompt(for: "polish", dictionary: dictionary)
                 let m = settings.model(for: "polish")
                 output = try await DeepSeekService.cleanup(
                     text: rawText,
@@ -599,10 +696,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             rawText: rawText,
             model: usedModel
         )
-        // 异步抽词入库（不阻塞出字）
+        // 异步抽词入库 + 风格学习（不阻塞出字）
         if settings.injectGlossary, settings.isConfigured {
             extractTermsInBackground(from: output)
         }
+        updateStyleInBackground(from: output)
 
         // Decide: paste at the cursor, or show the result in a panel?
         // Pop the panel only when we're confident there's nowhere to paste:
@@ -646,10 +744,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// normal (non-streaming) path (e.g. failed before any token).
     private func streamAndType(_ rawText: String, dictionary: DictionaryStore) async -> Bool {
         let isFormat = settings.tier == "format"
-        var prompt = isFormat ? settings.formatPrompt : settings.systemPrompt
-        if settings.injectGlossary, let glossary = dictionary.correctionGlossary {
-            prompt += glossary
-        }
+        let prompt = buildPrompt(for: settings.tier, dictionary: dictionary)
         let model = settings.model(for: settings.tier)
 
         statusText = "AI 处理中…"
@@ -686,6 +781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         if settings.injectGlossary {
             extractTermsInBackground(from: output)
         }
+        updateStyleInBackground(from: output)
 
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         if self.statusText == "已粘贴 ✓" { self.statusText = "准备就绪" }
@@ -712,6 +808,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 }
             } catch {
                 print("[PunkType] ⚠️ Term extraction failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Incrementally learn the user's expression style from an output sample.
+    /// Skips trivial outputs and only runs when "套用我的风格" is on.
+    private func updateStyleInBackground(from text: String) {
+        guard settings.applyStyle, settings.isConfigured,
+              text.trimmingCharacters(in: .whitespacesAndNewlines).count >= 12 else { return }
+        let apiKey = settings.apiKey
+        let model = settings.modelPolish
+        let endpoint = settings.apiEndpoint
+        let current = StyleProfileStore.shared.profile
+        Task {
+            do {
+                let updated = try await DeepSeekService.updateStyleProfile(
+                    current: current,
+                    sample: text,
+                    apiKey: apiKey,
+                    model: model,
+                    endpoint: endpoint
+                )
+                guard !updated.isEmpty else { return }
+                await MainActor.run {
+                    StyleProfileStore.shared.set(updated)
+                }
+            } catch {
+                print("[PunkType] ⚠️ Style update failed: \(error.localizedDescription)")
             }
         }
     }

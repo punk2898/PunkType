@@ -267,4 +267,42 @@ enum DeepSeekService {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty && $0.count <= 30 }
     }
+
+    // MARK: - Style profile update (async post-processing)
+
+    private static let stylePrompt = """
+    你在维护一份"用户表达风格画像"，用于让语音转写的整理更贴合用户本人的表达习惯。
+    请根据用户最新的一段文字，对已有画像做增量更新。要求：
+    1. 用中文，不超过 150 字
+    2. 概括这些维度：语气、句子长短、常用口头禅/高频词、标点习惯、中英文混用程度、对人的称呼习惯、正式或随意倾向
+    3. 是"增量微调"：在已有画像基础上小步修正，保持稳定，不要因为一段文字就推翻重写
+    4. 只输出更新后的画像本身，不要任何解释或前后缀
+    """
+
+    /// Incrementally update the user's style profile from a new sample.
+    static func updateStyleProfile(
+        current: String,
+        sample: String,
+        apiKey: String,
+        model: String,
+        endpoint: String
+    ) async throws -> String {
+        let user = """
+        【已有画像】
+        \(current.isEmpty ? "（暂无，请基于这段文字新建）" : current)
+
+        【用户最新文字】
+        \(sample)
+        """
+        let raw = try await chat(
+            system: stylePrompt,
+            user: user,
+            apiKey: apiKey,
+            model: model,
+            endpoint: endpoint,
+            maxTokens: 256,
+            timeout: 20
+        )
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }

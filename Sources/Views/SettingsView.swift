@@ -8,6 +8,7 @@ struct SettingsView: View {
     @ObservedObject var settings = Settings.shared
     @ObservedObject var historyManager = HistoryManager.shared
     @ObservedObject var dictionary = DictionaryStore.shared
+    @ObservedObject var styleStore = StyleProfileStore.shared
 
     @State private var showApiKey = false
     @State private var showOpenAIKey = false
@@ -25,6 +26,9 @@ struct SettingsView: View {
 
             dictionaryTab
                 .tabItem { Label("词典", systemImage: "character.book.closed") }
+
+            personalizeTab
+                .tabItem { Label("个性化", systemImage: "person.crop.circle") }
 
             historyTab
                 .tabItem { Label("历史", systemImage: "clock.arrow.circlepath") }
@@ -63,10 +67,15 @@ struct SettingsView: View {
                             launchAtLogin = SMAppService.mainApp.status == .enabled
                         }
                     }
+
+                Toggle("开始 / 停止提示音", isOn: $settings.playSounds)
             } header: {
                 Text("触发")
             } footer: {
-                Text("按一下快捷键开始录音，再按一下停止。选中文字时按快捷键会进入命令模式。")
+                Text("按一下快捷键开始录音，再按一下停止。选中文字时按快捷键会进入命令模式。" +
+                     (settings.hotkey == "fn"
+                      ? "\n\n用 🌐 Fn 键时，若按 Fn 会弹出表情或听写，请到「系统设置 → 键盘 →『按下 🌐 键时』」改为「无操作」。"
+                      : ""))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -78,10 +87,12 @@ struct SettingsView: View {
                         Text(Settings.tierLabels[tier] ?? tier).tag(tier)
                     }
                 }
+                Toggle("按应用自动调整语气（App 感知）", isOn: $settings.appAware)
             } header: {
                 Text("输出")
             } footer: {
-                Text(tierFooter + "\n每一档的识别引擎、模型、流式输出、提示词都可在「档位」标签里单独自定义。")
+                Text(tierFooter + "\n每一档的识别引擎、模型、流式输出、提示词都可在「档位」标签里单独自定义。" +
+                     "\nApp 感知：自动识别你正在哪个应用输入，聊天软件用口语、邮件更正式、代码/终端保留术语。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -378,6 +389,70 @@ struct SettingsView: View {
         .padding(20)
     }
 
+    // MARK: - 个性化（风格画像）
+
+    private var personalizeTab: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("风格画像")
+                    .font(.headline)
+                Spacer()
+                if styleStore.hasProfile {
+                    Button("重置") { styleStore.reset() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+            }
+
+            Toggle("套用我的风格（自动学习并应用到润色）", isOn: $settings.applyStyle)
+
+            Text("开启后，每次出字会异步学习你的表达习惯（语气、句长、口头禅、标点、中英混用、称呼），润色时贴合，但不改变原意。完全本地、仅自己可见。每次会多一次后台模型调用。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            Text("当前画像（可手动编辑）")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            if styleStore.hasProfile || settings.applyStyle {
+                TextEditor(text: Binding(
+                    get: { styleStore.profile },
+                    set: { styleStore.set($0) }
+                ))
+                .font(.system(size: 13))
+                .padding(6)
+                .frame(maxWidth: .infinity, minHeight: 160)
+                .background(Color(nsColor: .textBackgroundColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.25))
+                )
+
+                Text("\(styleStore.profile.count) 字")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "person.crop.circle.badge.questionmark")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.secondary)
+                    Text("还没有学到你的风格")
+                        .foregroundStyle(.secondary)
+                    Text("打开上面的开关，正常用几次后，这里就会形成一段你的表达风格画像。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            Spacer()
+        }
+        .padding(20)
+    }
+
     // MARK: - 历史
 
     private var historyTab: some View {
@@ -469,7 +544,7 @@ struct SettingsView: View {
             Text("说人话，出成品。")
                 .foregroundStyle(.secondary)
 
-            Text("版本 1.1.0")
+            Text("版本 1.2.0")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

@@ -20,15 +20,17 @@ final class Settings: ObservableObject {
 
     // MARK: Per-tier configuration (each tier is an editable preset)
     // STT engine per tier: local | apple-fast | whisper
-    @AppStorage("stt_fast")   var sttFast: String = "local"
-    @AppStorage("stt_polish") var sttPolish: String = "local"
-    @AppStorage("stt_format") var sttFormat: String = "local"
+    // Default to Apple 快速识别 (macOS 26 SpeechAnalyzer); auto-falls back to
+    // the classic local engine on macOS 25 and earlier.
+    @AppStorage("stt_fast")   var sttFast: String = "apple-fast"
+    @AppStorage("stt_polish") var sttPolish: String = "apple-fast"
+    @AppStorage("stt_format") var sttFormat: String = "apple-fast"
     // Cleanup model per tier (fast tier has no model)
     @AppStorage("model_polish") var modelPolish: String = "deepseek-v4-flash"
     @AppStorage("model_format") var modelFormat: String = "deepseek-v4-pro"
     // Streaming output per tier (type into cursor as it generates)
-    @AppStorage("stream_polish") var streamPolish: Bool = false
-    @AppStorage("stream_format") var streamFormat: Bool = false
+    @AppStorage("stream_polish") var streamPolish: Bool = true
+    @AppStorage("stream_format") var streamFormat: Bool = true
 
     // Prompts (per tier)
     @AppStorage("systemPrompt") var systemPrompt: String = defaultPrompt
@@ -44,6 +46,15 @@ final class Settings: ObservableObject {
 
     // Personal dictionary glossary injection
     @AppStorage("injectGlossary") var injectGlossary: Bool = true
+
+    // Light start/stop cue sounds
+    @AppStorage("playSounds") var playSounds: Bool = true
+
+    // App-aware tone: inject the frontmost app's scene into the prompt
+    @AppStorage("appAware") var appAware: Bool = true
+
+    // Style profile: learn the user's expression style and apply it to polish
+    @AppStorage("applyStyle") var applyStyle: Bool = false
 
     // MARK: - Per-tier accessors
 
@@ -64,7 +75,7 @@ final class Settings: ObservableObject {
     }
 
     // Global hotkey preset
-    @AppStorage("hotkey") var hotkey: String = "opt-space"
+    @AppStorage("hotkey") var hotkey: String = "fn"
 
     var isConfigured: Bool {
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -99,7 +110,10 @@ final class Settings: ObservableObject {
         let modifiers: UInt32
     }
 
+    // The "fn" preset is special: it's a single dedicated key handled via an
+    // NSEvent flagsChanged monitor (keyCode/modifiers are unused for it).
     static let hotkeyPresets: [HotkeyPreset] = [
+        .init(id: "fn", label: "🌐 Fn 键", keyCode: 0, modifiers: 0),
         .init(id: "opt-space", label: "⌥ Space", keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey)),
         .init(id: "ctrl-opt-space", label: "⌃⌥ Space", keyCode: UInt32(kVK_Space), modifiers: UInt32(controlKey | optionKey)),
         .init(id: "opt-cmd-space", label: "⌥⌘ Space", keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | cmdKey)),
