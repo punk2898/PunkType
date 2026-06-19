@@ -122,6 +122,18 @@ struct PunkTypeApp: App {
 
                 Divider()
 
+                Button(action: { appDelegate.openNotebook() }) {
+                    HStack {
+                        Image(systemName: "book.closed")
+                        Text("记事本…")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .option])
+                .buttonStyle(.plain)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+
                 Button(action: { appDelegate.openSettings() }) {
                     HStack {
                         Image(systemName: "gear")
@@ -160,7 +172,9 @@ struct PunkTypeApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var hotKeyRef: EventHotKeyRef?
+    private var notebookHotKeyRef: EventHotKeyRef?
     private var settingsWindow: NSWindow?
+    private var notebookWindow: NSWindow?
     private var overlayPanel: NSPanel?
 
     // Fn-key trigger (handled via NSEvent monitors, not Carbon)
@@ -184,6 +198,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     /// App scene captured at recording start → injected into the prompt so the
     /// cleanup tone matches where you're typing (chat/mail/code/…).
     private var recordingAppContext: AppContextService.Context?
+
+    /// When the user stopped recording — origin for diagnostic stage timings.
+    private var sttStopTime: Date?
+    private func ms(since t: Date?) -> Int {
+        guard let t else { return -1 }
+        return Int(Date().timeIntervalSince(t) * 1000)
+    }
 
     /// Selected text captured when recording started → command mode
     private var commandTarget: String?
@@ -211,8 +232,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DiagnosticLog.enabled = settings.diagnostics
         setupHotkeyHandler()
         registerHotkey()
+
+        // On launch, backfill daily reports for past days that don't have one
+        // yet (so yesterday's report is ready the next morning). Delayed so it
+        // doesn't slow startup; never touches today (still in progress).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.autoGenerateMissingReports()
+        }
 
         // Trigger system Accessibility prompt once (silent if already granted)
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -230,11 +259,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         let target = Unmanaged.passUnretained(self).toOpaque()
         InstallEventHandler(
             GetApplicationEventTarget(),
-            { (_, _, userData) -> OSStatus in
+            { (_, eventRef, userData) -> OSStatus in
                 guard let ptr = userData else { return noErr }
                 let delegate = Unmanaged<AppDelegate>.fromOpaque(ptr).takeUnretainedValue()
+                var hkID = EventHotKeyID()
+                GetEventParameter(eventRef, EventParamName(kEventParamDirectObject),
+                                  EventParamType(typeEventHotKeyID), nil,
+                                  MemoryLayout<EventHotKeyID>.size, nil, &hkID)
+                let id = hkID.id
                 Task { @MainActor in
-                    delegate.toggleRecording()
+                    if id == 2 { delegate.openNotebook() } else { delegate.toggleRecording() }
                 }
                 return noErr
             },
@@ -243,6 +277,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             target,
             nil
         )
+
+        // Notebook hotkey: ⌥⌘N (fixed, independent of the main trigger).
+        let nbID = EventHotKeyID(signature: 0x70756E6B, id: 2)
+        RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(optionKey | cmdKey),
+                            nbID, GetApplicationEventTarget(), 0, &notebookHotKeyRef)
     }
 
     /// (Re)register the global hotkey from the current settings preset.
@@ -474,11 +513,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         ensureRecognizer()
 
         // Remember where we started so we can tell if the user switches away,
-        // and capture the app scene for tone adaptation.
+        // and capture the app scene (used for tone adaptation + notebook source).
         recordingFrontmostPID = FocusService.frontmostPID()
-        recordingAppContext = settings.appAware
-            ? AppContextService.current(forPID: recordingFrontmostPID)
-            : nil
+        recordingAppContext = AppContextService.current(forPID: recordingFrontmostPID)
 
         // Command mode: text selected in the host app → speak an instruction
         commandTarget = settings.isConfigured ? SelectionService.selectedText() : nil
@@ -518,6 +555,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         isRecording = false
         overlayPhase = .processing
         statusText = "AI 处理中…"
+        sttStopTime = Date()
+        DiagnosticLog.log("STOP — tier=\(settings.tier) app=\(recordingAppContext?.appName ?? "?")")
 
         // Stop cue — the engine is stopped synchronously inside stopRecording
         // below, and the system sound has enough latency that it isn't captured.
@@ -535,6 +574,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     private func handleTranscription(localText: String) async {
         var text = localText
+        DiagnosticLog.log("STT delivered +\(ms(since: sttStopTime))ms (\(localText.count)字)")
 
         // 当前档选了 Whisper 时优先用 Whisper；本机识别为空时也兜底 Whisper
         let preferWhisper = settings.sttEngine(for: settings.tier) == "whisper"
@@ -578,7 +618,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         if settings.injectGlossary, let glossary = dictionary.correctionGlossary {
             prompt += glossary
         }
-        if let ctx = recordingAppContext {
+        if settings.appAware, let ctx = recordingAppContext {
             prompt += "\n\n【当前场景】用户正在「\(ctx.appName)」中输入。"
                 + (ctx.hint ?? "请贴合该应用常见的输入场景自然整理。")
         }
@@ -646,8 +686,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             let switchedAway = recordingFrontmostPID == nil
                 || FocusService.frontmostPID() != recordingFrontmostPID
             let canType = !switchedAway && FocusService.editableFocusState() != .nonEditable
-            if canType, await streamAndType(rawText, dictionary: dictionary) {
-                return
+            if canType {
+                if await streamAndType(rawText, dictionary: dictionary) { return }
+            } else {
+                DiagnosticLog.log("→ 走非流式（switchedAway=\(switchedAway), nonEditable=\(!switchedAway)）")
             }
         }
 
@@ -687,6 +729,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             output = rawText
             usedModel = "raw (fallback)"
         }
+        DiagnosticLog.log("非流式 完成 +\(ms(since: sttStopTime))ms (\(output.count)字)")
 
         self.lastResult = output
 
@@ -701,6 +744,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             extractTermsInBackground(from: output)
         }
         updateStyleInBackground(from: output)
+        recordToNotebook(output)
 
         // Decide: paste at the cursor, or show the result in a panel?
         // Pop the panel only when we're confident there's nowhere to paste:
@@ -763,12 +807,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                     // First token arrived — clear the overlay so typing is visible
                     overlayPhase = .hidden
                     overlayPanel?.orderOut(nil)
+                    DiagnosticLog.log("流式 首字 +\(ms(since: sttStopTime))ms")
                 }
                 typed += delta
                 TypeService.insert(delta)
             }
+            DiagnosticLog.log("流式 完成 +\(ms(since: sttStopTime))ms (\(typed.count)字)")
         } catch {
             print("[PunkType] ⚠️ Streaming failed after \(typed.count) chars: \(error.localizedDescription)")
+            DiagnosticLog.log("流式 出错 +\(ms(since: sttStopTime))ms (已出\(typed.count)字): \(error.localizedDescription)")
             if typed.isEmpty { return false } // nothing typed → safe to fall back
         }
 
@@ -782,6 +829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             extractTermsInBackground(from: output)
         }
         updateStyleInBackground(from: output)
+        recordToNotebook(output)
 
         try? await Task.sleep(nanoseconds: 1_200_000_000)
         if self.statusText == "已粘贴 ✓" { self.statusText = "准备就绪" }
@@ -838,6 +886,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 print("[PunkType] ⚠️ Style update failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    // MARK: - Notebook
+
+    /// Record a dictation output into the notebook (unless disabled / app excluded).
+    private func recordToNotebook(_ text: String) {
+        guard settings.notebookEnabled else { return }
+        NotebookStore.shared.record(
+            text: text,
+            app: recordingAppContext?.appName ?? "未知应用",
+            bundleID: recordingAppContext?.bundleID ?? "",
+            tier: settings.tier
+        )
+    }
+
+    /// Generate (or regenerate) the daily report for a day, then call back.
+    func generateDailyReport(day: String, entriesText: String, completion: @escaping @MainActor () -> Void) {
+        let apiKey = settings.apiKey
+        let model = settings.modelPolish
+        let endpoint = settings.apiEndpoint
+        guard settings.isConfigured else { completion(); return }
+        Task {
+            defer { Task { @MainActor in completion() } }
+            do {
+                let report = try await DeepSeekService.dailySummary(
+                    entriesText: entriesText, apiKey: apiKey, model: model, endpoint: endpoint
+                )
+                await MainActor.run {
+                    NotebookStore.shared.setSummary(day: day, DailySummary(
+                        title: report.title, body: report.body, generatedAt: Date()
+                    ))
+                }
+            } catch {
+                print("[PunkType] ⚠️ Daily report failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Generate reports for past days (not today) that have entries but no
+    /// summary yet. Capped to the most recent few to avoid an API burst.
+    func autoGenerateMissingReports() {
+        guard settings.notebookEnabled, settings.isConfigured else { return }
+        let store = NotebookStore.shared
+        let today = NotebookStore.dayKey(Date())
+        let candidates = store.availableDates
+            .filter { $0 != today }
+            .prefix(7)
+            .filter { day in
+                guard let note = store.loadDay(day) else { return false }
+                return note.summary == nil && !note.entries.isEmpty
+            }
+        guard !candidates.isEmpty else { return }
+
+        let apiKey = settings.apiKey, model = settings.modelPolish, endpoint = settings.apiEndpoint
+        Task {
+            for day in candidates {
+                guard let note = store.loadDay(day) else { continue }
+                let text = note.entries
+                    .map { "\($0.timeLabel) [\($0.sourceApp)] \($0.text)" }
+                    .joined(separator: "\n")
+                do {
+                    let report = try await DeepSeekService.dailySummary(
+                        entriesText: text, apiKey: apiKey, model: model, endpoint: endpoint
+                    )
+                    await MainActor.run {
+                        store.setSummary(day: day, DailySummary(
+                            title: report.title, body: report.body, generatedAt: Date()
+                        ))
+                    }
+                } catch {
+                    print("[PunkType] ⚠️ Auto report failed for \(day): \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func openNotebook() {
+        if let window = notebookWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let view = NotebookView(appDelegate: self)
+        let window = NSWindow(contentViewController: NSHostingController(rootView: view))
+        window.title = "PunkType 记事本"
+        window.setContentSize(NSSize(width: 760, height: 520))
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        notebookWindow = window
     }
 
     // MARK: - Settings Window

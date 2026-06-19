@@ -125,7 +125,7 @@ enum DeepSeekService {
         prompt: String,
         endpoint: String,
         maxTokens: Int = 1024,
-        timeout: TimeInterval = 30,
+        timeout: TimeInterval = 20,
         disableThinking: Bool = true
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
@@ -278,6 +278,52 @@ enum DeepSeekService {
     3. 是"增量微调"：在已有画像基础上小步修正，保持稳定，不要因为一段文字就推翻重写
     4. 只输出更新后的画像本身，不要任何解释或前后缀
     """
+
+    // MARK: - Notebook daily summary
+
+    private static let dailySummaryPrompt = """
+    你是用户的工作日志助手。下面是用户某一天通过语音输入产生的若干条内容（按时间顺序）。
+    请汇总成一份当天的「日报」。要求：
+    1. 用中文
+    2. 严格输出 JSON，格式：{"title": "一句话标题", "body": "markdown 正文"}
+    3. title：一句话概括这一天（不超过 20 字）
+    4. body 用 markdown，包含这几节（没有内容的节可省略）：
+       **做了什么**（分点）、**重要**（分点）、**不重要**（分点）、**思考 / 待办**（分点）
+    5. 只根据给定内容，不要编造
+    6. 只输出 JSON，不要任何额外文字或代码块标记
+    """
+
+    struct DailyReport: Decodable { let title: String; let body: String }
+
+    /// Generate a daily report from a day's dictation entries.
+    static func dailySummary(
+        entriesText: String,
+        apiKey: String,
+        model: String,
+        endpoint: String
+    ) async throws -> DailyReport {
+        let raw = try await chat(
+            system: dailySummaryPrompt,
+            user: entriesText,
+            apiKey: apiKey,
+            model: model,
+            endpoint: endpoint,
+            maxTokens: 1024,
+            timeout: 30
+        )
+        // Strip accidental ```json fences, then decode.
+        var json = raw
+        if let r = json.range(of: "{"), let r2 = json.range(of: "}", options: .backwards) {
+            json = String(json[r.lowerBound...r2.lowerBound])
+        }
+        if let data = json.data(using: .utf8),
+           let report = try? JSONDecoder().decode(DailyReport.self, from: data) {
+            return report
+        }
+        // Fallback: use the first line as title, the rest as body.
+        let lines = raw.split(separator: "\n", maxSplits: 1).map(String.init)
+        return DailyReport(title: lines.first ?? "今日记录", body: lines.count > 1 ? lines[1] : raw)
+    }
 
     /// Incrementally update the user's style profile from a new sample.
     static func updateStyleProfile(

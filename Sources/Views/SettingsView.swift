@@ -9,6 +9,7 @@ struct SettingsView: View {
     @ObservedObject var historyManager = HistoryManager.shared
     @ObservedObject var dictionary = DictionaryStore.shared
     @ObservedObject var styleStore = StyleProfileStore.shared
+    @ObservedObject var notebook = NotebookStore.shared
 
     @State private var showApiKey = false
     @State private var showOpenAIKey = false
@@ -191,6 +192,29 @@ struct SettingsView: View {
                 Text("OpenAI 密钥（Whisper，可选）")
             } footer: {
                 Text("仅在使用 Whisper 云端转写时需要。默认模型 gpt-4o-mini-transcribe。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            // 记事本
+            Section {
+                Toggle("记事本（自动收录每次口述）", isOn: $settings.notebookEnabled)
+                if !notebook.knownApps.isEmpty {
+                    DisclosureGroup("收录范围（勾选 = 收录该应用）") {
+                        ForEach(notebook.knownApps.sorted(by: { $0.value < $1.value }), id: \.key) { bid, name in
+                            Toggle(name, isOn: Binding(
+                                get: { !notebook.isExcluded(bundleID: bid) },
+                                set: { notebook.setExcluded(bid, excluded: !$0) }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .font(.caption)
+                        }
+                    }
+                }
+            } header: {
+                Text("记事本")
+            } footer: {
+                Text("每次出字会自动收进本地记事本（⌥⌘N 打开）。默认收录所有应用，微信默认不收录；用过的应用会出现在上面的勾选列表里。完全本地。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -544,7 +568,7 @@ struct SettingsView: View {
             Text("说人话，出成品。")
                 .foregroundStyle(.secondary)
 
-            Text("版本 1.2.0")
+            Text("版本 1.3.0")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -561,6 +585,19 @@ struct SettingsView: View {
             .font(.callout)
 
             Spacer()
+
+            VStack(spacing: 4) {
+                Toggle("写诊断日志（排查卡顿，记录耗时不记内容）", isOn: $settings.diagnostics)
+                    .controlSize(.small)
+                    .onChange(of: settings.diagnostics) { _, on in
+                        DiagnosticLog.enabled = on
+                        if !on { DiagnosticLog.clear() }
+                    }
+                Text("日志：~/punktype-diagnostics.log")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: 360)
 
             Text("开源项目 · github.com/punk2898/PunkType")
                 .font(.caption)

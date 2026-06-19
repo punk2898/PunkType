@@ -9,6 +9,7 @@ enum AppContextService {
 
     struct Context {
         let appName: String
+        let bundleID: String
         let hint: String?   // nil = unknown app; just pass the name through
     }
 
@@ -16,8 +17,8 @@ enum AppContextService {
     static func current(forPID pid: pid_t?) -> Context? {
         guard let pid, let app = NSRunningApplication(processIdentifier: pid) else { return nil }
         let name = app.localizedName ?? "应用"
-        let bid = (app.bundleIdentifier ?? "").lowercased()
-        return Context(appName: name, hint: hint(forBundleID: bid))
+        let bid = app.bundleIdentifier ?? ""
+        return Context(appName: name, bundleID: bid, hint: hint(forBundleID: bid.lowercased()))
     }
 
     private static func hint(forBundleID bid: String) -> String? {

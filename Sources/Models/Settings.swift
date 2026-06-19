@@ -56,6 +56,12 @@ final class Settings: ObservableObject {
     // Style profile: learn the user's expression style and apply it to polish
     @AppStorage("applyStyle") var applyStyle: Bool = false
 
+    // Diagnostic timing log (opt-in, for tracing rare hangs)
+    @AppStorage("diagnostics") var diagnostics: Bool = false
+
+    // Notebook: passively record every dictation into a local日报-able notebook
+    @AppStorage("notebookEnabled") var notebookEnabled: Bool = true
+
     // MARK: - Per-tier accessors
 
     func sttEngine(for tier: String) -> String {
