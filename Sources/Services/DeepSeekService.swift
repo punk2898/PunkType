@@ -4,6 +4,17 @@ import Foundation
 
 enum DeepSeekService {
 
+    /// Dedicated session (not URLSession.shared) so streaming connections we
+    /// manage here can't poison the app-wide shared pool, with a bounded
+    /// connection count.
+    private static let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 60
+        cfg.httpMaximumConnectionsPerHost = 6
+        cfg.waitsForConnectivity = true
+        return URLSession(configuration: cfg)
+    }()
+
     struct ChatRequest: Encodable {
         let model: String
         let messages: [Message]
@@ -89,7 +100,7 @@ enum DeepSeekService {
         urlRequest.httpBody = try JSONEncoder().encode(request)
         urlRequest.timeoutInterval = timeout
 
-        let (data, response) = try await URLSession.shared.data(for: urlRequest)
+        let (data, response) = try await session.data(for: urlRequest)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
@@ -153,7 +164,14 @@ enum DeepSeekService {
                     request.httpBody = try JSONEncoder().encode(body)
                     request.timeoutInterval = timeout
 
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    let (bytes, response) = try await session.bytes(for: request)
+                    // Critical: release the underlying connection when we stop
+                    // reading (we break early on [DONE]). Without this the data
+                    // task lingers and connections leak, so over a long session
+                    // new requests queue behind stuck sockets and get slower and
+                    // slower until they time out — until the app is restarted.
+                    defer { bytes.task.cancel() }
+
                     guard let http = response as? HTTPURLResponse else {
                         throw URLError(.badServerResponse)
                     }

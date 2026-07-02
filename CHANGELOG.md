@@ -4,6 +4,14 @@
 
 ---
 
+## [1.4.1] — 2026-07-02
+
+### 🐛 修复
+
+- **越用越慢、要重启才恢复**：流式请求读到结尾后没有关闭底层连接，连接在会话中不断泄漏，攒满连接池后新请求排队变慢直至超时（重启 App 才清空）。现在读完即释放连接，并改用独立的、限制连接数的会话，和系统共享池隔离。这个问题所有人用久了都会遇到，强烈建议升级。
+
+---
+
 ## [1.4.0] — 2026-06-21
 
 新增「翻译」「询问」两个动作快捷键，修了几个影响体验的 bug，并改用**企业 Developer ID 签名 + 公证**（双击直接打开、零拦截）。
@@ -129,6 +137,7 @@
 - 全局快捷键预设、开机自启
 - 中英双语 README，匿名签名的下载包
 
+[1.4.1]: https://github.com/punk2898/PunkType/releases/tag/v1.4.1
 [1.4.0]: https://github.com/punk2898/PunkType/releases/tag/v1.4.0
 [1.3.0]: https://github.com/punk2898/PunkType/releases/tag/v1.3.0
 [1.2.0]: https://github.com/punk2898/PunkType/releases/tag/v1.2.0
